@@ -8,6 +8,7 @@ package io.music_assistant.client.api
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlin.math.minOf
 
 /**
  * Two-phase reconnection backoff.
@@ -27,7 +28,8 @@ fun reconnectBackoffMs(attempt: Int): Long = when (attempt) {
     else -> 60_000L
 }
 
-const val DEFAULT_MAX_RECONNECT_ATTEMPTS = 10
+/** Max reconnect attempts. Set to -1 for infinite retries. */
+const val DEFAULT_MAX_RECONNECT_ATTEMPTS = -1
 
 /**
  * Runs a reconnection loop with two-phase backoff.
@@ -44,15 +46,21 @@ suspend fun runReconnectionLoop(
     onAttemptStarting: (attempt: Int) -> Unit,
     tryConnect: suspend (attempt: Int) -> Boolean,
 ): Boolean {
-    for (attempt in 0 until maxAttempts) {
-        onAttemptStarting(attempt + 1)
+    val infinite = maxAttempts < 0
+    var attempt = 0
+    while (infinite || attempt < maxAttempts) {
         if (networkAvailable != null && !networkAvailable.value) {
-            // Network is down — wait for it instead of wasting a timed delay
+            // Network is down — wait for it without burning attempts or applying backoff
             networkAvailable.first { it }
         } else {
-            delay(reconnectBackoffMs(attempt))
+            // Network is up — apply two-phase backoff. In infinite mode, cap the
+            // backoff index at 9 so delay stays at 60 s after the 10th attempt.
+            val capped = if (infinite) minOf(attempt, 9) else attempt
+            delay(reconnectBackoffMs(capped))
         }
+        onAttemptStarting(attempt + 1)
         if (tryConnect(attempt + 1)) return true
+        attempt++
     }
     return false
 }
