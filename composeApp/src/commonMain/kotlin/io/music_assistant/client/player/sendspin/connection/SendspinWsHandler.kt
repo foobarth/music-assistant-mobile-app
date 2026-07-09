@@ -56,6 +56,9 @@ class SendspinWsHandler(
     private var reconnectJob: Job? = null
     private val maxReconnectAttempts = DEFAULT_MAX_RECONNECT_ATTEMPTS
 
+    // Callback invoked after a successful automatic reconnect
+    var onReconnected: (() -> Unit)? = null
+
     private val _textMessages = MutableSharedFlow<String>(extraBufferCapacity = 50)
     val textMessages: Flow<String> = _textMessages.asSharedFlow()
 
@@ -227,6 +230,7 @@ class SendspinWsHandler(
                         reconnectAttempts = 0
                         _connectionState.value = WebSocketState.Connected
                         startListening(wsSession)
+                        onReconnected?.invoke()
                         true
                     } catch (e: Exception) {
                         logger.w(e) { "Reconnect attempt $attempt failed" }

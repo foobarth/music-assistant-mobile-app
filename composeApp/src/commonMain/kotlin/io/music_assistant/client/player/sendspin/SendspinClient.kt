@@ -176,6 +176,9 @@ class SendspinClient(
                     WebSocketState.Connected -> {
                         when (_state.value) {
                             is SendspinState.Connecting, is SendspinState.Reconnecting -> {
+                                val wasStreaming =
+                                    (_state.value as? SendspinState.Reconnecting)?.wasStreaming
+                                        ?: false
                                 try {
                                     if (config.requiresAuth) {
                                         _state.update { SendspinState.Authenticating }
@@ -186,6 +189,15 @@ class SendspinClient(
                                     }
                                 } catch (e: Exception) {
                                     logger.w { "Failed to send auth/hello (transport closed during handshake): ${e.message}" }
+                                }
+                                // Auto-resume playback if we were streaming before the disconnect
+                                if (wasStreaming) {
+                                    try {
+                                        mediaPlayerController.resume()
+                                        logger.i { "Auto-resumed playback after reconnect" }
+                                    } catch (e: Exception) {
+                                        logger.w(e) { "Auto-resume failed" }
+                                    }
                                 }
                             }
                             else -> Unit
