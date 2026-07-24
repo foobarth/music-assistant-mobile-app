@@ -934,6 +934,10 @@ class MainDataSource(
         launch {
             when (action) {
                 PlayerAction.TogglePlayPause -> {
+                    // Resolve toggle to explicit play/pause — same logic as
+                    // PlayerRequestFactory. We have no local PlayerData here,
+                    // so send the toggle verbatim for server players; the server
+                    // manages its own toggle state correctly.
                     apiClient.sendRequest(
                         Request.Player.simpleCommand(
                             playerId = playerId,

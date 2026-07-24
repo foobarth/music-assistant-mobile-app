@@ -27,8 +27,13 @@ class PlayerRequestFactory(
 
     fun buildRequest(data: PlayerData, action: PlayerAction): Request? {
         return when (action) {
-            PlayerAction.TogglePlayPause ->
-                Request.Player.simpleCommand(playerId = data.playerId, command = "play_pause")
+            PlayerAction.TogglePlayPause -> {
+                // Resolve toggle to explicit play/pause based on current player state.
+                // This prevents state mismatch after reconnect where the client's
+                // toggle assumption could flip the wrong way.
+                val cmd = if (data.player.isPlaying) "pause" else "play"
+                Request.Player.simpleCommand(playerId = data.playerId, command = cmd)
+            }
 
             PlayerAction.Play ->
                 Request.Player.simpleCommand(playerId = data.playerId, command = "play")

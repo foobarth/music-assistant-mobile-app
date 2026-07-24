@@ -154,6 +154,11 @@ class DirectTransport(
         val s = session ?: return
         val countBefore = messageCounter
         scope.launch {
+            // Grace period before the first probe: after iOS background → foreground
+            // the WebSocket may need a few hundred ms to become responsive again.
+            // Without this delay the ping fails, triggering an unnecessary reconnect.
+            delay(500)
+
             val sendOk = try {
                 s.send(Frame.Ping(byteArrayOf()))
                 true

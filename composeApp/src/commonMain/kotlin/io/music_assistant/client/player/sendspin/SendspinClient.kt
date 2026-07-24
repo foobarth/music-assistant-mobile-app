@@ -71,6 +71,13 @@ class SendspinClient(
     private var currentVolume: Int = mediaPlayerController.getCurrentSystemVolume()
     private var currentMuted: Boolean = false
 
+    /** Persistent streaming flag; survives transport disconnect/reconnect cycles.
+     *  Set on stream/start, cleared on stream/end or explicit stop.
+     *  Used instead of [SendspinState.Reconnecting.wasStreaming] which is lost
+     *  when the transport transitions directly to Backgrounded (skipping
+     *  Reconnecting). */
+    private var wasStreaming: Boolean = false
+
     val metadata: StateFlow<StreamMetadataPayload?>
         get() = messageDispatcher?.streamMetadata ?: MutableStateFlow(null)
 
@@ -189,7 +196,6 @@ class SendspinClient(
                             is SendspinState.Error,
                             -> {
                                 val reconnecting = _state.value as? SendspinState.Reconnecting
-                                val wasStreaming = reconnecting?.wasStreaming ?: false
                                 val reconnectAttempt = reconnecting?.attempt ?: 0
                                 try {
                                     if (config.requiresAuth) {
@@ -210,6 +216,7 @@ class SendspinClient(
                                     try {
                                         mediaPlayerController.resume()
                                         logger.i { "Auto-resumed playback after reconnect (attempt $reconnectAttempt)" }
+                                        wasStreaming = false  // Only fire once per stream
                                     } catch (e: Exception) {
                                         logger.w(e) { "Auto-resume failed" }
                                     }
@@ -298,6 +305,7 @@ class SendspinClient(
             dispatcher.streamStartEvent.collect { event ->
                 event.payload.player?.let { playerConfig ->
                     audioPipeline.startStream(playerConfig)
+                    wasStreaming = true
                     _state.update { SendspinState.Buffering }
                     // Start periodic state reporting
                     stateReporter?.start()
@@ -309,6 +317,7 @@ class SendspinClient(
             dispatcher.streamEndEvent.collect {
                 val current = _state.value
                 audioPipeline.stopStream()
+                wasStreaming = false
                 if (current is SendspinState.Buffering || current is SendspinState.Synchronized) {
                     val serverInfo = messageDispatcher?.serverInfo?.value
                     val nextState = if (serverInfo != null) {
