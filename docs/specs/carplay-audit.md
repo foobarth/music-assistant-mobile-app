@@ -9,7 +9,7 @@
 
 ## 1. Summary
 
-Audit of the CarPlay integration covering the iOS scene delegate, content manager, Siri intents, the KMP bridge, and the local-player dispatch path. Found **13 issues**: 2 bugs, 5 control-flow defects, and 6 resilience gaps.
+Audit of the CarPlay integration covering the iOS scene delegate, content manager, Siri intents, the KMP bridge, and the local-player dispatch path. Found **16 issues**: 2 bugs, 7 control-flow defects, and 7 resilience gaps.
 
 ---
 
@@ -294,6 +294,152 @@ KmpHelper.shared.loadCarPlayStrings(timeoutMs: 5_000) { loaded in
 
 ---
 
+### 2.14 CarPlay Stuck on "No Connection" After Permanent Transport Failure
+
+**Severity:** Control · **Impact:** App restart required to recover CarPlay
+
+**Observed:** When `DirectTransport` exhausts its 20 reconnection attempts (~24 min), it enters `TransportState.Failed`. `isReadyForCommands` stays `false` permanently. `CarPlaySceneDelegate.handleReadinessChange()` sets `isReady = false`, which triggers the "disconnected row" affordance — but there is **no code path** that calls `forceReconnect()` or `onAppForeground()` from CarPlay. The transport stays dead until the user manually kills and restarts the app.
+
+**Root cause:** The transport's `Failed` state is final — it only recovers through an explicit `connect()` or `onAppForeground()`. CarPlay never triggers either. The phone's screen may be off (CarPlay alone is active), so `onAppForeground` never fires.
+
+**File:** `CarPlaySceneDelegate.swift` lines 136–153 (handleReadinessChange), `KtorServiceClient.kt` (reconnect entry points)
+
+**Fix:** When `handleReadinessChange` observes `isReady` staying `false` after it was previously `true` (connection lost), schedule a reconnection probe:
+```swift
+private func handleReadinessChange(_ ready: Bool) {
+    ...
+    if !ready && wasReady {
+        // Transport failed while CarPlay is active — schedule a reconnect probe
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self = self, !self.isReady else { return }
+            KmpHelper.shared.reconnectFromCurrent()
+        }
+    }
+}
+```
+Add `fun reconnectFromCurrent()` to `KmpHelper.kt` that calls `serviceClient.onAppForeground()` to kick the reconnection loop.
+
+Alternatively: make the `Failed` state auto-retry with a long backoff (5 min → 15 min → 60 min) instead of being terminal.
+
+**Risk:** Low — scheduled retry is bounded and only fires when CarPlay is active.
+
+---
+
+### 2.15 Now Playing Title/Position Desync on Track Change
+
+**Severity:** Control · **Impact:** User sees wrong title or position on CarPlay screen
+
+**Observed:** Two compounding causes:
+
+**A) Artwork deferral:** `NowPlayingCoordinator.handleTrack()` defers the metadata write until artwork is loaded. If artwork takes 2-5 seconds (see 2.16), the lock screen and CarPlay show the **previous track's** title during that window. For short tracks or podcast segments with frequent transitions, the label is permanently behind.
+
+**B) Lost transport anchor after artwork-less update:** When artwork is skipped (no URL, nil) or cache-hit (same URL), `applyTrackKeys` runs with `rebuildingGroup = true`. This rebuilds the info center keys — including position — by calling `setTransport` from `lastTransport`. But `lastTransport` is only available if the transport channel already emitted for this track. If the track channel fires before the transport channel (normal ordering), `lastTransport.mediaItemId != track.mediaItemId`, the restore is skipped, and the position stays at the old value.
+
+**Log evidence (field report, line 1233):**
+```
+Info center assign: 8 keys title=Finish Line rate=1.00 elapsed=0.4
+// Correct — but only after artwork arrived. Previous seconds showed old title.
+```
+
+**File:** `NowPlayingCoordinator.swift` lines 155–226 (track handler), 280–322 (transport handler), 235–263 (applyTrackKeys)
+
+**Fix for A:** Set a timeout on artwork deferral (max 2s), then present with placeholder artwork:
+```swift
+// In handleTrack(), line 193:
+let deferWrite = isNewTrack || artworkWaitTrackId == track.mediaItemId
+if deferWrite {
+    artworkWaitTrackId = track.mediaItemId
+    // Timeout: present metadata even without artwork after 2 seconds
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        guard let self = self, self.artworkWaitTrackId == track.mediaItemId else { return }
+        self.applyTrackKeys(track, artwork: nil, rebuildingGroup: true)
+        self.artworkWaitTrackId = nil
+    }
+}
+```
+
+**Fix for B:** In `applyTrackKeys` with `rebuildingGroup = true`, always set the elapsed time — even without a matching `lastTransport` — from the track's own startup position (0.0 for new track, or the server-provided `elapsedSec`):
+```swift
+if rebuildingGroup, let last = lastTransport, last.mediaItemId == track.mediaItemId {
+    // restore from cached transport…
+} else if rebuildingGroup {
+    // New track, no transport anchor yet — set position to 0 / start
+    infoStore.setTransport(elapsedSec: track.startPosition?.doubleValue ?? 0.0, rate: 1.0)
+}
+```
+
+**Risk:** Low — presenting metadata earlier can only improve the user experience.
+
+---
+
+### 2.16 Artwork Cache Misses on Every Load
+
+**Severity:** Resilience · **Impact:** Images reload from network on every appearance
+
+**Observed:** `CarPlayImageLoader` (line 10) uses `NSCache<NSString, UIImage>` with **no disk cache** and **no cost limit**. Three compounding causes:
+
+**A) Cache volatility:** `NSCache` is pure in-memory. Under memory pressure — common in a car with CarPlay + navigation + music running — iOS evicts the entire cache. Reload from scratch on next appearance.
+
+**B) URL variance:** The cache key is `urlString` from `item.image(type: .thumb)?.url`. MA server URLs may include auth tokens, expiry timestamps, or session-bound paths. If the URL changes between sessions (e.g. token refreshed), the cache key changes too — even for the same artwork.
+
+**C) WebRTC proxy latency:** `loadArtworkBytes` routes through the KMP WebRTC HTTP proxy (`webrtcHttpClient`). In CarPlay mode the phone is typically on cellular, adding 200-500ms per request. Combined with A and B, every grid row reloads artwork from the server.
+
+**File:** `CarPlayImageLoader.swift` lines 12–29, `KmpHelper.kt` lines 82, 460+
+
+**Fix:** Three-tier cache strategy:
+```swift
+class CarPlayImageLoader {
+    // Tier 1: In-memory (fast, volatile)
+    private let memCache = NSCache<NSString, UIImage>()
+    // Tier 2: File-system (persistent across sessions)
+    private let diskCache = DiskCache(name: "carplay-images", limitMB: 50)
+    // Tier 3: Network
+
+    func loadImage(from urlString: String, completion: @escaping (UIImage?) -> Void) {
+        // 1. Normalise URL: strip query parameters beyond the path (remove auth tokens)
+        let cacheKey = Self.normalisedKey(urlString)
+
+        // 2. Check memory cache
+        if let cached = memCache.object(forKey: cacheKey as NSString) { completion(cached); return }
+
+        // 3. Check disk cache (async)
+        if let data = diskCache.read(key: cacheKey), let image = UIImage(data: data) {
+            memCache.setObject(image, forKey: cacheKey as NSString)
+            completion(image); return
+        }
+
+        // 4. Network — load through KMP proxy, then write to both caches
+        KmpHelper.shared.loadArtworkBytes(urlString: urlString) { [weak self] data in
+            guard let data = data as Data?, let image = UIImage(data: data) else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            self?.memCache.setObject(image, forKey: cacheKey as NSString)
+            self?.diskCache.write(key: cacheKey, data: data)
+            DispatchQueue.main.async { completion(image) }
+        }
+    }
+
+    /// Strip session-bound tokens from the URL so the same artwork always
+    /// produces the same cache key.
+    private static func normalisedKey(_ url: String) -> String {
+        guard let components = URLComponents(string: url) else { return url }
+        // Keep only path + essential query items; drop auth/session params
+        var clean = URLComponents()
+        clean.scheme = components.scheme
+        clean.host = components.host
+        clean.path = components.path
+        return clean.string ?? url
+    }
+}
+```
+
+Set `memCache.totalCostLimit = 5_000_000` (≈5 MB, ~200 thumbnail-sized images) to prevent unbounded growth.
+
+**Risk:** Low — additive caching, no behavioural change for the already-working first load.
+
+---
+
 ## 3. Implementation Plan
 
 ### Phase 1 — Bug Fixes (low risk, high correctness)
@@ -311,6 +457,8 @@ KmpHelper.shared.loadCarPlayStrings(timeoutMs: 5_000) { loaded in
 |---|------|--------|
 | 2.4 | `LocalPlayerDispatch.kt`, `KmpHelper.kt`, `CarPlayContentManager.swift`, `CarPlaySceneDelegate.swift` | Propagate real dispatch outcome; gate Now Playing push on success |
 | 2.3 | `CarPlaySceneDelegate.swift` | Strengthen `isReady` with transport-state confirmation |
+| 2.14 | `CarPlaySceneDelegate.swift`, `KmpHelper.kt` | Auto-reconnect probe when CarPlay sees persistent `isReady = false` |
+| 2.15 | `NowPlayingCoordinator.swift` | Artwork deferral timeout (2s); set track start position in `applyTrackKeys` |
 | 2.5 | `CarPlaySceneDelegate.swift` | Safe `pop(to:)` — replace `contains` with `firstIndex` |
 | 2.7 | `CarPlaySceneDelegate.swift` | Default-category fallback when configured list empty |
 | 2.6 | `CarPlaySceneDelegate.swift` | Weak template capture + stack check before `updateSections` |
@@ -322,6 +470,7 @@ KmpHelper.shared.loadCarPlayStrings(timeoutMs: 5_000) { loaded in
 
 | # | File | Change |
 |---|------|--------|
+| 2.16 | `CarPlayImageLoader.swift` | Three-tier cache (memory + disk + network), URL normalisation, cost limit |
 | 2.8 | `SiriIntentHandler.swift` | Retry on affinity-set failure |
 | 2.9 | `SiriIntentHandler.swift` | Deferred donation when `serverId` not yet available |
 | 2.10 | `KmpHelper.kt`, `SiriIntentHandler.swift` | Type-hint filter in search API |
@@ -345,7 +494,10 @@ KmpHelper.shared.loadCarPlayStrings(timeoutMs: 5_000) { loaded in
 | T7 | Siri "I love this song" during reconnect | Retries, eventually succeeds | 3 |
 | T8 | Cold CarPlay connect, tap first item | Donation fires after `serverId` arrives | 3 |
 | T9 | Siri "play album X" | Search limited to albums | 3 |
-| T10 | `loadCarPlayStrings` hangs | English fallback after 5s, templates build | 3 |
+| T11 | Transport fails (20 attempts exhausted) while CarPlay active | Auto-reconnect probe fires after 5s, recovers | 2 |
+| T12 | Rapid track changes with slow artwork (2-5s each) | Metadata visible within 2s, placeholder art until real art loads | 2 |
+| T13 | Browse grid, go back, browse again same row | Artwork loads from cache (<50ms), no network request | 3 |
+| T14 | Force memory warning → browse grid again | Artwork reloads from disk cache, not network | 3 |
 
 ---
 
@@ -354,7 +506,9 @@ KmpHelper.shared.loadCarPlayStrings(timeoutMs: 5_000) { loaded in
 ```
 iosApp/iosApp/CarPlay/CarPlaySceneDelegate.swift
 iosApp/iosApp/CarPlay/CarPlayContentManager.swift
+iosApp/iosApp/CarPlay/CarPlayImageLoader.swift
 iosApp/iosApp/CarPlay/SiriIntentHandler.swift
+iosApp/iosApp/NowPlayingCoordinator.swift
 composeApp/src/commonMain/kotlin/io/music_assistant/client/data/LocalPlayerDispatch.kt
 composeApp/src/iosMain/kotlin/io/music_assistant/client/di/KmpHelper.kt
 composeApp/src/iosMain/kotlin/io/music_assistant/client/carplay/CarPlayStrings.kt
