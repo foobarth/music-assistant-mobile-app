@@ -9,7 +9,7 @@
 
 ## 1. Summary
 
-Audit of the CarPlay integration covering the iOS scene delegate, content manager, Siri intents, the KMP bridge, and the local-player dispatch path. Found **16 issues**: 2 bugs, 7 control-flow defects, and 7 resilience gaps.
+Audit of the CarPlay integration covering the iOS scene delegate, content manager, Siri intents, the KMP bridge, and the local-player dispatch path. Found **18 issues**: 2 bugs, 8 control-flow defects, and 8 resilience gaps.
 
 ---
 
@@ -440,6 +440,56 @@ Set `memCache.totalCostLimit = 5_000_000` (≈5 MB, ~200 thumbnail-sized images)
 
 ---
 
+### 2.17 Missing `clearNowPlaying()` Between Track Changes
+
+**Severity:** Control · **Impact:** CarPlay shows stale metadata between track transitions
+
+**Matrix analysis (2026-07-22):** The `NowPlayingSnapshot` collection in `MainDataSource.kt` (lines 749–762) collapses track changes: it goes directly from `Active` → `Active` without emitting `Cleared`. An explicit `clearNowPlaying()` between tracks would flush stale metadata from `CPNowPlayingTemplate` so the UI shows nothing instead of the **previous** track's title/artist/album for the 2–30 seconds until artwork loads.
+
+**Observed at KMP level:**
+```kotlin
+.collect { snapshot ->
+    when (snapshot) {
+        NowPlayingSnapshot.Cleared -> mediaPlayerController.clearNowPlaying()
+        is NowPlayingSnapshot.Active -> mediaPlayerController.updateNowPlaying(...)
+    }
+}
+```
+
+**File:** `MainDataSource.kt` lines 749–762, `NowPlayingCoordinator.swift` (receives the update)
+
+**Fix:** Emit a synthetic `Cleared` when `snapshot.id` (or a sequence counter) changes before the next `Active`. Or, at the iOS receiver side, clear existing metadata before applying new keys:
+
+```swift
+// NowPlayingCoordinator.swift — at the start of updateNowPlaying()
+MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+```
+
+**Risk:** Very low — clearing before setting is a standard iOS pattern.
+
+---
+
+### 2.18 Drilldown Cascade — Three RPC Calls per Play
+
+**Severity:** Resilience · **Impact:** Timeout-prone on cellular CarPlay connections
+
+**Matrix analysis (2026-07-22):** Each play from the browse grid requires three sequential RPC calls:
+1. `pushAlbumsForArtist` — list albums
+2. `pushTracksForAlbum` — list tracks
+3. `playTrack` — start playback
+
+Every call is subject to `FETCH_TIMEOUT_MS` (5s). On cellular CarPlay connections, each can time out independently. After any timeout the user sees an empty/disconnected row and must navigate back and re-enter the drilldown.
+
+**File:** `CarPlayContentManager.swift` (tap handlers), `KmpHelper.kt` (fetch timeout)
+
+**Fix (Option A — low effort):** Eager-load album tracks when the album list is fetched, caching them so the track-tap only requires the play call. The album list already has `AlbumBrief.items` — add a flag to include track list in the same response.
+
+**Fix (Option B — medium effort):** Allow playlist/album-tap to start playback immediately (play the album/playlist), skipping the track-level drilldown. CarPlay's `CPListTemplate` already supports a `playingIndicatorLocation` — add a play-all button as the first row.
+
+**Risk:** Low (Option A) — only moves existing calls, doesn't change the play path.
+
+---
+
 ## 3. Implementation Plan
 
 ### Phase 1 — Bug Fixes (low risk, high correctness)
@@ -462,9 +512,10 @@ Set `memCache.totalCostLimit = 5_000_000` (≈5 MB, ~200 thumbnail-sized images)
 | 2.5 | `CarPlaySceneDelegate.swift` | Safe `pop(to:)` — replace `contains` with `firstIndex` |
 | 2.7 | `CarPlaySceneDelegate.swift` | Default-category fallback when configured list empty |
 | 2.6 | `CarPlaySceneDelegate.swift` | Weak template capture + stack check before `updateSections` |
-| 2.12 | `CarPlaySceneDelegate.swift` | Gate bulk-action Now Playing push on actual dispatch |
+|| 2.12 | `CarPlaySceneDelegate.swift` | Gate bulk-action Now Playing push on actual dispatch |
+|| 2.17 | `MainDataSource.kt`, `NowPlayingCoordinator.swift` | Clear `nowPlayingInfo` on track change before applying new metadata |
 
-**Verification:** Tap while disconnected → offline alert, not silence. Template update after back-navigation → no-op.
+**Verification:** Tap while disconnected → offline alert, not silence. Template update after back-navigation → no-op. Rapid track changes → no stale metadata on CarPlay.
 
 ### Phase 3 — Resilience (low risk, additive)
 
@@ -476,8 +527,9 @@ Set `memCache.totalCostLimit = 5_000_000` (≈5 MB, ~200 thumbnail-sized images)
 | 2.10 | `KmpHelper.kt`, `SiriIntentHandler.swift` | Type-hint filter in search API |
 | 2.11 | `CarPlaySceneDelegate.swift` | Per-operation `connectionGen` guard |
 | 2.13 | `CarPlaySceneDelegate.swift`, `CarPlayStrings.kt` | Timeout + English fallback for string loading |
+| 2.18 | `CarPlayContentManager.swift`, `KmpHelper.kt` | Eager-load album tracks on album list fetch (Option A) |
 
-**Verification:** Affinity during reconnect → retries. First CarPlay play → eventual donation. Timeout → full default grid.
+**Verification:** Affinity during reconnect → retries. First CarPlay play → eventual donation. Timeout → full default grid. Browse grid from cellular → no timeout on play.
 
 ---
 
